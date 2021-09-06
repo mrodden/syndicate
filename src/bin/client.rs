@@ -16,25 +16,68 @@
 
 use tracing_subscriber;
 
-use syndicate::{AppendEntriesRequest, LogEntry, Request};
+use std::{env, thread, time};
+use syndicate::client::RaftClient;
 
 fn main() {
     tracing_subscriber::fmt::init();
 
-    let req = AppendEntriesRequest {
-        term: 3,
-        leader_id: 2,
-        prev_log_index: 0,
-        prev_log_term: 0,
-        entries: [
-            LogEntry::new(0, "stuff", "things"),
-            LogEntry::new(0, "1other", "yep"),
-            LogEntry::new(0, "1things", "yep"),
-            LogEntry::new(2, "1things", "yep"),
-            LogEntry::new(3, "overwritten", "because 'm the boss"),
-        ]
-        .into(),
-        leader_commit: 4,
-    };
-    println!("{:?}", syndicate::append_entries(&req, "127.0.0.1:3001"));
+    let servers: Vec<String> = ["127.0.0.1:3001", "127.0.0.1:3002", "127.0.0.1:3003"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let mut rc = RaftClient::new(servers.clone());
+
+    let mut zero = String::from("");
+    let mut command: String = String::from("");
+    let mut key: String = String::from("");
+    let mut val: String = String::from("");
+
+    for arg in env::args() {
+        if zero.is_empty() {
+            zero = arg;
+            continue;
+        }
+        if command.is_empty() {
+            command = arg;
+            continue;
+        }
+        if key.is_empty() {
+            key = arg;
+            continue;
+        }
+        if val.is_empty() {
+            val = arg;
+            continue;
+        }
+    }
+
+    match command.as_str() {
+        "getlogs" => {
+            for s in servers.iter() {
+                println!("{:?}", rc.get_log(&s).unwrap());
+            }
+        }
+        "get" => {
+            rc.update_master_addr();
+            if let Some(ret) = rc.get(&key).unwrap() {
+                println!("{:#?}", ret);
+            } else {
+                println!("None");
+            }
+        }
+        "set" => {
+            rc.update_master_addr();
+            if let Some(ret) = rc.set(&key, &val).unwrap() {
+                println!("{:#?}", ret);
+            } else {
+                println!("None");
+            }
+        }
+        e => {
+            println!("unrecognized command: {}", e);
+            println!("usage: client COMMAND [key] [val]");
+        }
+    }
 }

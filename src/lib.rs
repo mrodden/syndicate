@@ -14,108 +14,31 @@
 // with this program; if not, write to the Free Software Foundation, Inc.,
 // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+pub mod client;
+pub mod rpc;
+
 use std::cmp::{max, min};
+use std::collections::HashMap;
 use std::convert::TryInto;
-use std::io::{Cursor, Read};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
 use rmp_serde::Serializer;
-use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
+
+pub use crate::rpc::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub type NodeId = u64;
 
-#[derive(Debug, Deserialize, Serialize)]
-pub enum Request {
-    AppendEntries(AppendEntriesRequest),
-    Vote(VoteRequest),
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct VoteRequest {
-    pub term: u64,
-    pub candidate_id: NodeId,
-    pub last_log_index: u64,
-    pub last_log_term: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct VoteResponse {
-    pub term: u64,
-    pub granted: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct AppendEntriesRequest {
-    pub term: u64,
-    pub leader_id: NodeId,
-    pub prev_log_index: u64,
-    pub prev_log_term: u64,
-    pub entries: Vec<LogEntry>,
-    pub leader_commit: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct AppendEntriesResponse {
-    pub term: u64,
-    pub success: bool,
-}
-
-fn call_rpc(req: Request, addr: &str) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    req.serialize(&mut Serializer::new(&mut buf)).unwrap();
-
-    let sock = UdpSocket::bind("0.0.0.0:0").unwrap();
-    sock.connect(addr).unwrap();
-    let sent = sock.send(&buf).unwrap();
-    if sent < buf.len() {
-        println!("not all data sent!");
-    }
-
-    let mut rbuf = [0; 4096];
-    let br = sock.recv(&mut rbuf)?;
-    let data = &mut rbuf[..br];
-    Ok(data.to_vec())
-}
-
-pub fn append_entries(req: &AppendEntriesRequest, addr: &str) -> Result<AppendEntriesResponse> {
-    let data = call_rpc(Request::AppendEntries(req.clone()), addr)?;
-    let resp: AppendEntriesResponse = rmp_serde::from_read_ref(&data).unwrap();
-    Ok(resp)
-}
-
-pub fn request_vote(req: &VoteRequest, addr: &str) -> Result<VoteResponse> {
-    let data = call_rpc(Request::Vote(req.clone()), addr)?;
-    let resp: VoteResponse = rmp_serde::from_read_ref(&data).unwrap();
-    Ok(resp)
-}
-
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
-pub struct LogEntry {
-    term: u64,
-    key: String,
-    val: String,
-}
-
-impl LogEntry {
-    pub fn new(term: u64, key: &str, val: &str) -> Self {
-        LogEntry {
-            term,
-            key: key.into(),
-            val: val.into(),
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct Node {
-    state: Arc<Mutex<NodeState>>,
+    inner: Arc<Mutex<NodeState>>,
+    my_addr: String,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +58,8 @@ struct NodeState {
     mode: Mode,
 
     last_request: Instant,
+
+    state: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -154,7 +79,7 @@ impl Peer {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Mode {
     Follower,
     Candidate,
@@ -162,11 +87,11 @@ enum Mode {
 }
 
 trait RPCServer {
-    fn serve_forever(&self, bind_addr: SocketAddr);
+    fn serve_forever(&self, bind_addr: &str);
 }
 
 impl RPCServer for Node {
-    fn serve_forever(&self, bind_addr: SocketAddr) {
+    fn serve_forever(&self, bind_addr: &str) {
         let socket = UdpSocket::bind(bind_addr).expect("failed to bind socket");
         info!("Listening on udp://{}", bind_addr);
         let mut buf = [0; 4096];
@@ -188,6 +113,21 @@ impl RPCServer for Node {
                     let buf = rmp_serde::to_vec(&resp).unwrap();
                     socket.send_to(&buf, src_addr);
                 }
+                Request::GetLog(r) => {
+                    let resp = self.handle_get_log(r);
+                    let buf = rmp_serde::to_vec(&resp).unwrap();
+                    socket.send_to(&buf, src_addr);
+                }
+                Request::Get(r) => {
+                    let resp = self.handle_get(r);
+                    let buf = rmp_serde::to_vec(&resp).unwrap();
+                    socket.send_to(&buf, src_addr);
+                }
+                Request::Set(r) => {
+                    let resp = self.handle_set(r);
+                    let buf = rmp_serde::to_vec(&resp).unwrap();
+                    socket.send_to(&buf, src_addr);
+                }
                 _ => {
                     socket.send_to(b"invalid request", src_addr);
                 }
@@ -198,18 +138,22 @@ impl RPCServer for Node {
 
 impl Node {
     pub fn new(node_id: u64, peers: Vec<Peer>) -> Self {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 3000 + node_id as u16));
+
         Node {
-            state: Arc::new(Mutex::new(NodeState {
+            inner: Arc::new(Mutex::new(NodeState {
                 node_id,
                 current_term: 0,
                 voted_for: None,
-                log: vec![],
+                log: vec![LogEntry::new(0, "", "")],
                 commit_index: 0,
                 last_applied: 0,
                 peers: peers.into(),
                 mode: Mode::Follower,
                 last_request: Instant::now(),
+                state: HashMap::new(),
             })),
+            my_addr: format!("{}", addr),
         }
     }
 
@@ -223,23 +167,55 @@ impl Node {
         let state_sync_thread = thread::spawn(move || {
             sync_clone.state_sync_main();
         });
-
-        let addr = SocketAddr::from((
-            [127, 0, 0, 1],
-            3000 + self.state.lock().unwrap().node_id as u16,
-        ));
-        self.serve_forever(addr);
+        self.serve_forever(&self.my_addr);
     }
 
     #[tracing::instrument]
+    fn handle_get(&self, req: GetRequest) -> GetResponse {
+        let inner = self.inner.lock().unwrap();
+        let val = if let Some(v) = inner.state.get(&req.key) {
+            Some(v.clone())
+        } else {
+            None
+        };
+        GetResponse { val }
+    }
+
+    #[tracing::instrument]
+    fn handle_set(&self, req: SetRequest) -> SetResponse {
+        let mut inner = self.inner.lock().unwrap();
+
+        let new_entry = LogEntry::new(inner.current_term, &req.key, &req.val);
+        inner.log.push(new_entry);
+
+        let old_val = if let Some(v) = inner.state.get(&req.key) {
+            Some(v.clone())
+        } else {
+            None
+        };
+
+        SetResponse { old_val }
+    }
+
+    #[tracing::instrument]
+    fn handle_get_log(&self, req: GetLogRequest) -> GetLogResponse {
+        let inner = self.inner.lock().unwrap();
+
+        GetLogResponse {
+            log: inner.log.clone(),
+        }
+    }
+
+    #[tracing::instrument(level = "debug")]
     fn handle_append_entries(&self, req: AppendEntriesRequest) -> AppendEntriesResponse {
-        let mut inner = self.state.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
         inner.last_request = Instant::now();
         debug!("Curr State: {:#?}", inner);
 
         if req.term > inner.current_term {
             inner.current_term = req.term;
             inner.mode = Mode::Follower;
+            info!("AppendEntries had higher term. Falling back to Follower");
         }
 
         let prev_log_idx: usize = req.prev_log_index.try_into().unwrap();
@@ -269,7 +245,7 @@ impl Node {
             }
         }
 
-        let mut last_index: u64 = 0;
+        let mut last_index: u64 = (prev_log_idx + 1).try_into().unwrap();
 
         // start processing log entries from request
         for (i, entry) in req.entries.iter().enumerate() {
@@ -290,14 +266,15 @@ impl Node {
             // no entry in log, or we just truncated; append
             inner.log.push(entry.clone());
 
-            debug!("New State: {:#?}", inner);
+            info!("Log Update. New logs: {:?}", inner.log);
         }
 
         if req.leader_commit > inner.commit_index {
             inner.commit_index = min(req.leader_commit, last_index);
+            info!("New commit index: {}", inner.commit_index);
         }
 
-        info!("Final State: {:?}", inner);
+        debug!("Final State: {:?}", inner);
         AppendEntriesResponse {
             term: inner.current_term,
             success: true,
@@ -306,7 +283,7 @@ impl Node {
 
     #[tracing::instrument]
     fn handle_request_vote(&self, req: VoteRequest) -> VoteResponse {
-        let mut inner = self.state.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
 
         if req.term < inner.current_term {
             info!("Vote requested for old term");
@@ -369,23 +346,27 @@ impl Node {
         info!("Leader thread started");
         loop {
             debug!("Leader loop start");
-            let mode = self.state.lock().unwrap().mode;
+            let mode = self.inner.lock().unwrap().mode;
             match mode {
                 Mode::Follower => {
-                    let last_req = self.state.lock().unwrap().last_request;
-                    info!("Checking election_timeout");
+                    let last_req = self.inner.lock().unwrap().last_request;
+                    debug!("Checking election_timeout");
                     if last_req.elapsed() > election_timeout {
                         info!("Election timeout hit");
-                        let mut inner = self.state.lock().unwrap();
+                        let mut inner = self.inner.lock().unwrap();
                         inner.mode = Mode::Candidate;
                     } else {
-                        info!("Sleeping");
-                        thread::sleep(election_timeout - last_req.elapsed());
+                        debug!("Sleeping");
+                        thread::sleep(
+                            election_timeout
+                                .checked_sub(last_req.elapsed())
+                                .unwrap_or(Duration::from_millis(0)),
+                        );
                     }
                 }
                 Mode::Candidate => {
                     info!("Starting new election");
-                    let mut inner = self.state.lock().unwrap();
+                    let mut inner = self.inner.lock().unwrap();
                     inner.current_term += 1;
                     inner.voted_for = Some(inner.node_id);
                     election_timeout = self.gen_new_election_time();
@@ -425,41 +406,46 @@ impl Node {
                             p.next_index = last_log_index + 1;
                             p.match_index = 0;
                         }
+                        let new_entry = LogEntry::new(
+                            inner.current_term,
+                            "leader_addr".into(),
+                            &self.my_addr.clone(),
+                        );
+                        inner.log.push(new_entry);
                     } else {
                         info!("Election ended: Not enough votes");
                     }
                 }
                 Mode::Leader => {
-                    info!("Leader round started");
-                    let mut inner = self.state.lock().unwrap();
+                    let mut inner = self.inner.lock().unwrap();
 
                     let start = Instant::now();
                     let last_log_index = get_last_log_index(&inner.log);
 
-                    // ping peers
-                    for peer in inner.peers.iter() {
-                        let prev_log_index = if peer.next_index == 0 {
-                            0
-                        } else {
-                            peer.next_index - 1
-                        };
-                        let prev_log_term = if prev_log_index <= 0 {
-                            0
-                        } else {
-                            inner.log.get((prev_log_index - 1) as usize).unwrap().term
-                        };
+                    //// ping peers
+                    //for peer in inner.peers.iter() {
+                    //    let prev_log_index = if peer.next_index == 0 {
+                    //        0
+                    //    } else {
+                    //        peer.next_index - 1
+                    //    };
+                    //    let prev_log_term = if prev_log_index <= 0 {
+                    //        0
+                    //    } else {
+                    //        inner.log.get((prev_log_index - 1) as usize).unwrap().term
+                    //    };
 
-                        let req = AppendEntriesRequest {
-                            term: inner.current_term,
-                            leader_id: inner.node_id,
-                            prev_log_index: prev_log_index,
-                            prev_log_term: prev_log_term,
-                            entries: vec![],
-                            leader_commit: inner.commit_index,
-                        };
+                    //    let req = AppendEntriesRequest {
+                    //        term: inner.current_term,
+                    //        leader_id: inner.node_id,
+                    //        prev_log_index: prev_log_index,
+                    //        prev_log_term: prev_log_term,
+                    //        entries: vec![],
+                    //        leader_commit: inner.commit_index,
+                    //    };
 
-                        append_entries(&req, &peer.addr);
-                    }
+                    //    append_entries(&req, &peer.addr);
+                    //}
 
                     let mut req = AppendEntriesRequest {
                         term: inner.current_term,
@@ -471,13 +457,13 @@ impl Node {
                     };
 
                     let log = inner.log.clone();
+                    let current_term = inner.current_term;
 
                     // catch up peers
-                    for peer in inner.peers.iter_mut() {
-                        if last_log_index > peer.next_index {
-                            continue;
+                    'outer: for peer in inner.peers.iter_mut() {
+                        if last_log_index < peer.next_index {
+                            debug!("{:?} all caught up", peer);
                         }
-                        // else, peer needs catchup or we should sync
 
                         loop {
                             let prev_log_index = if peer.next_index == 0 {
@@ -502,23 +488,70 @@ impl Node {
                                     break;
                                 }
                             };
+
+                            if resp.term > current_term {
+                                inner.mode = Mode::Follower;
+                                break 'outer;
+                            }
+
                             if resp.success {
-                                info!("Peer update successful");
-                                peer.next_index = last_log_index;
+                                debug!("Peer update successful");
+                                peer.next_index = last_log_index + 1;
                                 peer.match_index = last_log_index;
                                 break;
                             } else {
-                                info!("Peer update not successful");
-                                peer.next_index -= 1;
+                                warn!("Peer update not successful");
+                                if peer.next_index > 0 {
+                                    peer.next_index -= 1;
+                                } else {
+                                    peer.next_index = 0;
+                                }
                             }
                         }
                     }
 
-                    drop(inner);
+                    if inner.mode == Mode::Leader {
+                        // sync commit index
+                        let mut new_commit_idx = None;
+                        for (i, log) in inner.log.iter().enumerate().rev() {
+                            if log.term != inner.current_term {
+                                continue;
+                            }
+                            let new_commit = (i + 1).try_into().unwrap();
+                            if new_commit <= inner.commit_index {
+                                // no new candidates left
+                                break;
+                            }
 
-                    let stime = heartbeat_time - start.elapsed();
-                    info!("Leader thread sleeping for {}ms", stime.as_millis());
-                    thread::sleep(stime);
+                            let mut count = 0;
+                            for peer in inner.peers.iter() {
+                                if peer.match_index >= new_commit {
+                                    count += 1;
+                                }
+                            }
+
+                            let quorum_size =
+                                calc_quorum_size(inner.peers.len().try_into().unwrap());
+                            debug!("new_commit: {}, i: {}", new_commit, i);
+                            debug!("Count: {}, Quorum: {}", count, quorum_size);
+
+                            if count >= quorum_size {
+                                new_commit_idx = Some(new_commit);
+                            }
+                        }
+
+                        if let Some(idx) = new_commit_idx {
+                            info!("New commit index: {}", idx);
+                            inner.commit_index = idx;
+                        }
+
+                        drop(inner);
+                        let stime = heartbeat_time
+                            .checked_sub(start.elapsed())
+                            .unwrap_or(Duration::from_millis(0));
+                        debug!("Leader thread sleeping for {}ms", stime.as_millis());
+                        thread::sleep(stime);
+                    }
                 }
             }
         }
@@ -534,18 +567,35 @@ impl Node {
     fn state_sync_main(&self) {
         info!("Sync thread started.");
         loop {
-            thread::sleep(std::time::Duration::from_millis(100));
-            let mut inner = self.state.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap();
             if inner.commit_index > inner.last_applied {
-                // apply
                 inner.last_applied += 1;
+                let log = inner.log.clone();
+                if let Some(next_log) =
+                    log.get::<usize>((inner.last_applied - 1).try_into().unwrap())
+                {
+                    info!(
+                        "Wrote log at index={} to state: {:?}",
+                        inner.last_applied, next_log
+                    );
+                    inner
+                        .state
+                        .insert(next_log.key.clone(), next_log.val.clone());
+                    info!(
+                        "Last applied: {}, Commit index: {}",
+                        inner.last_applied, inner.commit_index
+                    );
+                }
+            } else {
+                drop(inner);
+                thread::sleep(std::time::Duration::from_millis(50));
             }
         }
     }
 }
 
 fn calc_quorum_size(num_peers: u64) -> u64 {
-    max((num_peers as f64 / 2.0).ceil() as u64, 1)
+    (num_peers as f64 / 2.0).floor() as u64 + 1
 }
 
 fn get_last_log_term(log: &[LogEntry]) -> u64 {
